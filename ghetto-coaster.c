@@ -1,3 +1,4 @@
+#include <math.h>       // don't forget to compile with -lm
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -5,6 +6,8 @@
 #include <pthread.h>    // don't forget to compile with -lpthread
 #include <sys/time.h>
 #include <X11/Xlib.h>   // don't forget to compile with -lX11
+
+#define PI 3.14159265
 
 struct CoasterConf {
   int triggerDistance;
@@ -16,8 +19,14 @@ struct CoasterConf {
  * Consts
  *
  */
-int const coastingDelayUsec = 35000; // just a tad longer than once every two frames
-int const coastingIntervalUsec = 8333; // about twice per frame
+int const COASTING_DELAY_USEC = 50000; // just a tad longer than once every two frames
+int const COASTING_INTERVAL_USEC = 8333; // about twice per frame
+
+// imagine pointer is coasting. The new touch doesn't provide enough events for full
+// coast, so program will add new samples to existing [x|y]PointerSpeedRemaining
+// that is, unless it's been this long since last pointer/scroll coast thing
+int const COASTING_RESTART_AFTER_USEC = 500000;
+double const MAX_COAST_ANGLE = 0.1;
 
 /**
  *
@@ -25,23 +34,22 @@ int const coastingIntervalUsec = 8333; // about twice per frame
  *
  */
 struct timeval lastPointerMoveTime, lastScrollTime;
-float xPointerSpeedRemaining, yPointerSpeedRemaining, pointerSpeedMultiplier = 10.0f;
-float currentPositionX, currentPositionY;
+double xPointerSpeedRemaining, yPointerSpeedRemaining, pointerSpeedMultiplier = 10.0, pointerFriction = 0.007, minMomentum = 42.0;
+double currentPositionX, currentPositionY;
 int currentPositionX_i, currentPositionY_i;
-float scrollSpeed, scrollSpeedMultiplier = 10.0f;
+double scrollSpeed, scrollSpeedMultiplier = 10.0;
 pthread_t threadBin;
 
 // valuator data:
-// other variables
-int valuatorSampleSize = 4;
+int valuatorSampleSize = 8;
 int valuator;
 int valuatorIndex[] = {0, 0, 0, 0};
 float amount;
-float movementSample[][4] = {
-  {0.0f, 0.0f, 0.0f, 0.0f},
-  {0.0f, 0.0f, 0.0f, 0.0f},
-  {0.0f, 0.0f, 0.0f, 0.0f},
-  {0.0f, 0.0f, 0.0f, 0.0f}
+float movementSample[][8] = {
+  {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+  {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}
 };
 
 // x display stuff
@@ -49,7 +57,8 @@ Display* dpy;
 int scr;
 Window rootWindow;
 
-      
+// preventScrollCoasting, preventPointerCoasting
+int preventScrollCoasting = 1, preventPointerCoasting = 1;
 
 // locks:
 pthread_mutex_t pointerCoasterDataLock;
@@ -91,9 +100,6 @@ int startsWith(const char *pre, const char *str) {
 int isTimeTooRecent(struct timeval* currentTime, struct timeval* mostRecentTime, int maxDiffUsec) {
   // returns '1' if the difference between times is less than usec
 
-  printf("differnce in seconds: %d; maxDiff: %d\n", currentTime->tv_sec - mostRecentTime->tv_sec, maxDiffUsec*0.000001);
-  printf("differnce in useconds: %d; maxDiff: %d\n", currentTime->tv_usec - mostRecentTime->tv_usec, maxDiffUsec);
-
   if (currentTime->tv_sec - mostRecentTime->tv_sec > maxDiffUsec * 0.000001) {
     return 0;
   }
@@ -122,10 +128,40 @@ int f2i(float x) {
  */
 
 
+// all angles use radians
+int detectDirectionChange(double oldAvgX, double oldAvgY, double avgX, double avgY, double acceptableDeviationAngle) {
+  double oldAngle = atan(oldAvgY / oldAvgX) + PI * 0.5;  // keep those values on [0,PI] instead
+  double currentAngle = atan(avgY / avgX) + PI * 0.5;    // same here
+
+  double thresholdMin = oldAngle - acceptableDeviationAngle;
+  double thresholdMax = oldAngle + acceptableDeviationAngle;
+
+  if (thresholdMin > 0) {
+    if (thresholdMax < PI) {
+      return currentAngle >= thresholdMin && currentAngle <= thresholdMax;
+    } else {
+      return currentAngle >= thresholdMin || currentAngle <= thresholdMax - PI;
+    }
+  } else {
+    if (thresholdMax < PI) {
+      return currentAngle >= thresholdMin + PI || currentAngle <= thresholdMax;
+    } else {
+      // this case really shoulnd't happen
+      return currentAngle >= thresholdMin + PI || currentAngle <= thresholdMax - PI;
+    }
+  }
+}
+
 void* pointerCoaster(int* xSample, int xSampleSize, int* ySample, int ySampleSize) {
-  usleep(coastingDelayUsec);
+  preventPointerCoasting = 0;
+  usleep(COASTING_DELAY_USEC);
+
+  if (preventPointerCoasting) {
+    printf("something is preventing pointer coasting. doing nothing");
+  }
 
   struct timeval currentTime;
+  double averageX = 0, averageY = 0;
 
   // stuff for X that we don't need
   Window rw;
@@ -138,30 +174,108 @@ void* pointerCoaster(int* xSample, int xSampleSize, int* ySample, int ySampleSiz
   
   pthread_mutex_lock(&pointerCoasterDataLock);
 
-  if (isTimeTooRecent(&currentTime, &lastPointerMoveTime, coastingIntervalUsec)) {
+  if (isTimeTooRecent(&currentTime, &lastPointerMoveTime, COASTING_INTERVAL_USEC)) {
     printf("Touchpad was moved too recently to start coasting!\n");
     pthread_mutex_unlock(&pointerCoasterDataLock);
     return;
   }
   printf("———————————— touchpad was moved just right! ————————\n");
 
+  // let's calculate our speed
+  int xs = 0, ys = 0;
+  for (int i = 0; i < valuatorSampleSize; i++) {
+    if (movementSample[0][i] != INFINITY) {
+      averageX += (double)movementSample[0][i];
+      ++xs;
+    }
+    if (movementSample[1][i] != INFINITY) {
+      averageY += (double)movementSample[1][i];
+      ++ys;
+    }
+  }
+
+  // if we didn't get all samples, we only start coasting if direction is maintained
+  // or if not enough time has passed.
+  // if direction changes too much or too much time has passed, we either do nothing
+  // or coast with incomplete data
+  if (xs < 8 || ys < 8) {
+    printf("check direction? %;", detectDirectionChange(xPointerSpeedRemaining, yPointerSpeedRemaining, averageX, averageY, MAX_COAST_ANGLE));
+    if (isTimeTooRecent(&currentTime, &lastPointerMoveTime, COASTING_RESTART_AFTER_USEC) && !detectDirectionChange(xPointerSpeedRemaining, yPointerSpeedRemaining, averageX, averageY, MAX_COAST_ANGLE)) {
+      printf("direction preserved: continuing coasting and preservign direction");
+      int xSpeedWeight = valuatorSampleSize - xs;
+      int ySpeedWeight = valuatorSampleSize - ys;
+      
+      averageX += xPointerSpeedRemaining * (double)xSpeedWeight;
+      averageY += yPointerSpeedRemaining * (double)ySpeedWeight;
+
+      xs = valuatorSampleSize;
+      ys = valuatorSampleSize;
+    }
+  }
+
+  if (!xs || !ys) {
+    printf("Not enough samples to start coasting!\n");
+    pthread_mutex_unlock(&pointerCoasterDataLock);
+    return;
+  }
+  xPointerSpeedRemaining = averageX / (double)xs;
+  yPointerSpeedRemaining = averageY / (double)ys;
+
+  // Calculate the speed at which the pointer was last moving and turn it
+  // into 'remaining speed'. 
+  
+
+  double momentum = sqrt((pow(averageX, 2) + pow(averageY, 2)));
+
+  printf("Speed calculated:\n  <> averageX: %f\n  <> averageY: %f\n  <> momentum: %f\n  <> cutoff:  %f\n\n",averageX, averageY, momentum, minMomentum);
+
+  if (momentum < minMomentum) {
+    printf("Not enough momentum to start coasting!\n");
+    pthread_mutex_unlock(&pointerCoasterDataLock);
+    return;
+  }
+
   // "first time setup" — initialize coasting direction
   XQueryPointer(dpy, rootWindow, &window_returned, &rw, &currentPositionX_i, &currentPositionY_i, &winx, &winy, &mask_return);
-  printf("initial position: %d,%d\n", currentPositionX_i, currentPositionY_i);
+  printf("Enough momentum to scroll. initial position: %d,%d\n", currentPositionX_i, currentPositionY_i);
+
+  // convert current position into something more accurate
+  currentPositionX = (double) currentPositionX_i;
+  currentPositionY = (double) currentPositionY_i;
+
+  // clear sample only now that it's apparent we aren't going to scroll
+  for (int i = 0; i < valuatorSampleSize; i++) {
+    movementSample[0][i] = INFINITY;
+    movementSample[1][i] = INFINITY;
+  }
 
   pthread_mutex_unlock(&pointerCoasterDataLock);
 
-  // while (true) {
-    if (isTimeTooRecent(&currentTime, &lastPointerMoveTime, coastingIntervalUsec)) {
+  // Continue moving mouse until all the 'remaining speed' is consumed
+  while (!preventPointerCoasting && (fabs(xPointerSpeedRemaining) > 0.1 || fabs(yPointerSpeedRemaining) > 0.1)) {
+    if (isTimeTooRecent(&currentTime, &lastPointerMoveTime, COASTING_DELAY_USEC)) {
       printf("Touchpad was moved while scrolling. We'll stop scrolling.\n");
       return;
     }
 
-    // XWarpPointer(dpy, None, rootWindow, 0, 0, 0, 0, f2i(currentPositionX), f2i(currentPositionY));
-    // XFlush(dpy);
+    // calculate new position
+    currentPositionX += xPointerSpeedRemaining;
+    currentPositionY += yPointerSpeedRemaining;
 
-    usleep(coastingIntervalUsec);
-  // }
+    // move cursor to the new position. While we're moving the cursor, nobody else is allowed to 
+    // interact with x server
+    pthread_mutex_lock(&pointerCoasterDataLock);
+    XWarpPointer(dpy, None, rootWindow, 0, 0, 0, 0, f2i(currentPositionX), f2i(currentPositionY));
+    XFlush(dpy);
+    pthread_mutex_unlock(&pointerCoasterDataLock);
+
+    // apply friction
+    xPointerSpeedRemaining -= xPointerSpeedRemaining * pointerFriction;
+    yPointerSpeedRemaining -= yPointerSpeedRemaining * pointerFriction;
+
+    usleep(COASTING_INTERVAL_USEC);
+  }
+  printf("——— [ not enough movement speed remaining to sustain scroll ] ———\nxPointerSpeedRemaining: %f\nyPointerSpeedRemaining: %f\n", xPointerSpeedRemaining, yPointerSpeedRemaining);
   return;
 }
 
@@ -242,6 +356,7 @@ void start(char* xinputDeviceId) {
           // determine whether we're scrolling or moving.
           if (valuator < 2) {
             gettimeofday(&lastPointerMoveTime, NULL);
+            preventPointerCoasting = 1;
 
             // start thread that'll eventually start moving mouse
             // we don't want to wait for threads to end, either, so 
@@ -251,6 +366,7 @@ void start(char* xinputDeviceId) {
             }
           } else if (valuator < 4) {
             gettimeofday(&lastScrollTime, NULL);
+            preventScrollCoasting = 1;
 
             // start thread that'll eventually start moving mouse
             // we don't want to wait for threads to end, either, so 
@@ -273,7 +389,9 @@ void start(char* xinputDeviceId) {
         sscanf(trimmedBuffer, "%d: %f (%*f)%*s", &valuator, &amount);
 
         printf("movement along valutaor %d: %f\n", valuator, amount);
-
+        
+        movementSample[valuator][valuatorIndex[valuator]] = amount;
+        valuatorIndex[valuator] = ++valuatorIndex[valuator] % valuatorSampleSize;
         
         continue;
       }
@@ -283,6 +401,12 @@ void start(char* xinputDeviceId) {
           isCorrectEvent = 1;
           continue;
         } else {
+          if (startsWith("EVENT type 15 (RawButtonPress)", trimmedBuffer)) {
+            // this is a very special kind of "not correct" event
+            // we kill coasting on touchpad tap
+            preventPointerCoasting = 1;
+            preventScrollCoasting = 1;
+          }
           isCorrectEvent = 0;
           continue;
         }
@@ -307,9 +431,9 @@ void start(char* xinputDeviceId) {
   }
 }
 
-int main(void) {
+int main(int argc, char* argv[]) {
   initXorg();
 
-  start("12");
+  start(argv[1]);
 }
 
