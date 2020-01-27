@@ -340,7 +340,13 @@ void start(char* xinputDeviceId) {
     // read one line from pipe
     while ((charactersRead = getline(&buffer, &bufsize, fstream)) != -1) {
 
+      // free previous value of trimmed buffer
+      free(trimmedBuffer);
+
       trimmedBuffer = trim(buffer);
+      if (trimmedBuffer != buffer) {
+        free(buffer);
+      }
 
       // if we're inside of the 'valuator' section of the output, we don't need
       // to process anything else.
@@ -426,6 +432,7 @@ void start(char* xinputDeviceId) {
         pthread_mutex_lock(&scrollCoasterDataLock);
       }
 
+      free(trimmedBuffer);
     };
     printf("Program ended.\n");
   }
