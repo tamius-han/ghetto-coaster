@@ -336,17 +336,17 @@ void start(char* xinputDeviceId) {
     // variables that we'll use to track whether we're getting the event we want to get
     int isCorrectEvent = 0;
     int isValuator = 0;
+    int mustFreeTrimmedBuffer = 0;
 
     // read one line from pipe
     while ((charactersRead = getline(&buffer, &bufsize, fstream)) != -1) {
 
-      // free previous value of trimmed buffer
-      free(trimmedBuffer);
-
-      trimmedBuffer = trim(buffer);
-      if (trimmedBuffer != buffer) {
-        free(buffer);
+      if (mustFreeTrimmedBuffer != 0) {
+        free(trimmedBuffer);
+        mustFreeTrimmedBuffer = 0;
       }
+      trimmedBuffer = trim(buffer);
+      mustFreeTrimmedBuffer = 1;
 
       // if we're inside of the 'valuator' section of the output, we don't need
       // to process anything else.
